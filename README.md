@@ -13,8 +13,8 @@ Please consult your distro's package manager or follow the links to get them ins
 
 First, clone this repo and cd into it:
 ```Bash
-git clone https://github.com/tage64/bible.com-scraper
-cd bible.com-scraper
+$ git clone https://github.com/tage64/bible.com-scraper
+$ cd bible.com-scraper
 ```
 
 Then, you must install the virtual environment and launch the Poetry shell:

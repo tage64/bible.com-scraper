@@ -11,7 +11,16 @@ import bs4
 import httpx
 import progressbar  # type: ignore
 
+# Number of tries if http connection times out.
+HTTP_TRIES: int = 3
+
 NUM_REGEX: re.Pattern = re.compile("[1-9][0-9]*")
+CHAPTER_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_chapter.*")
+VERSE_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_verse.*")
+CONTENT_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_content.*")
+VERSE_USFM_REGEX: re.Pattern = re.compile(
+    "([A-Za-z0-9]+)\.([1-9][0-9]*)\.([1-9][0-9]*)"
+)
 
 
 class Book(NamedTuple):
@@ -104,38 +113,73 @@ async def get_verses(
     """Get a list of all verses in a chapter.
     Some verses might be missing and is then set to `None`.
     """
-    url = f"https://www.bible.com/en-GB/bible/{bible_id}/{book_code}.{chapter_idx + 1}.KJV/"
-    page = await http_client.get(url)
+    url = f"https://www.bible.com/bible/{bible_id}/{book_code}.{chapter_idx+1}.KJV"
+    tries: int = 1
+    while True:
+        try:
+            page = await http_client.get(url)
+            break
+        except httpx.ReadTimeout:
+            assert tries < HTTP_TRIES, f"Http timeout with {tries} tries."
+            tries += 1
+            continue
     page.raise_for_status()  # Raise an exception if the request failed with a bad status code.
     soup = bs4.BeautifulSoup(page.content, "html.parser")
-    chapter_find = soup.find(class_=f"chapter ch{chapter_idx + 1}")
+    chapter_find = soup.find(class_=CHAPTER_CLASS_REGEX)
     assert isinstance(chapter_find, bs4.Tag)
-    no_ver = len(chapter_find.find_all(class_="label", text=NUM_REGEX)) - 1
+
+    # This is a list of HTML tags corresponding to verses.
+    # There might be zero to many number of verse-tags per verse.
+    verse_tags: List = chapter_find.find_all(class_=VERSE_CLASS_REGEX)
 
     verses: list[str | None] = []
-    for i in range(no_ver):
-        verse = soup.find(class_=re.compile(f"verse v{i + 1}"))
-        if verse is None:
-            verses.append(None)
+    for verse_tag in verse_tags:
+        assert isinstance(verse_tag, bs4.Tag)
+        current_verse_no: int = len(verses)
+        usfm = verse_tag["data-usfm"]
+        assert isinstance(usfm, str)
+        usfm_match = VERSE_USFM_REGEX.fullmatch(usfm)
+        assert isinstance(usfm_match, re.Match), f"Couldn't match usfm code: {usfm}."
+        assert (
+            usfm_match[1] == book_code
+        ), f"Wrong book code for verse {usfm_match.string}, expected {book_code}."
+        assert usfm_match[2] == str(
+            chapter_idx + 1
+        ), f"Wrong chapter index for verse. {usfm_match.string}, expected {chapter_idx + 1}."
+        verse_no: int = int(usfm_match[3])
+        assert verse_no >= current_verse_no, "Verses are not in order."
+        content_tags: List = verse_tag.find_all(class_=CONTENT_CLASS_REGEX)
+        contents: str = "".join((x.string for x in content_tags))
+        if verse_no == current_verse_no:
+            assert isinstance(verses[-1], str)
+            verses[-1] += "\n" + contents
         else:
-            assert isinstance(verse, bs4.Tag), f"Was type: {type(verse)}, {verse}"
-            content: str = "".join((x.text for x in verse.find_all(class_="content")))
-            verses.append(content)
+            while verse_no > current_verse_no + 1:
+                verses.append(None)
+                current_verse_no += 1
+            verses.append(contents)
     return verses
 
 
 async def store_bible(
-        bible_id: int, output_dir: str, book_code: str|None=None, max_line_len: int | None = None
+    bible_id: int,
+    output_dir: str,
+    book_code: str | None = None,
+    max_line_len: int | None = None,
 ) -> None:
     """Fetch the bible and save it in `output_dir` with one sub-directory per book
     and one file per chapter.
     The argument `book` can be set to a 3-letter code to specify a certain book to download.
     """
-    text_wrapper: TextWrapper | None = TextWrapper() if max_line_len else None
+    text_wrapper: TextWrapper | None = (
+        TextWrapper(replace_whitespace=False) if max_line_len else None
+    )
     books: list[Book] = await get_bible(bible_id, book_code)
     for book in books:
         # Make a directory for the book.
-        book_dir: str = os.path.join(output_dir, f"{str(book.idx).rjust(2, '0')}_{book.name}")
+        book_dir: str = os.path.join(
+            output_dir, f"{str(book.idx).rjust(2, '0')}_{book.name}"
+        )
         os.makedirs(book_dir, exist_ok=True)
 
         # Compute the length of the numbers for the chapters.
@@ -144,8 +188,11 @@ async def store_bible(
         for j, chapter in enumerate(book.chapters):
             # Compute the length of the numbers for the verses.
             verse_num_len: int = math.ceil(math.log10(len(chapter)))
+            indent: int = verse_num_len + 2
             if text_wrapper is not None:
-                text_wrapper.subsequent_indent = " " * (verse_num_len + 2)
+                assert max_line_len is not None
+                assert max_line_len > indent, "Lines are too short for verse numbers."
+                text_wrapper.width = max_line_len - indent
 
             with open(
                 os.path.join(book_dir, f"{str(j + 1).rjust(chapter_num_len, '0')}.txt"),
@@ -154,12 +201,13 @@ async def store_bible(
                 for k, verse in enumerate(chapter):
                     if verse is None:
                         continue
-                    verse_text: str = (
-                        str(k + 1).rjust(verse_num_len, " ") + ". " + verse
-                    )
+                    file.write(str(k + 1).rjust(verse_num_len, " ") + ". ")
+                    verse_lines: list[str] = verse.splitlines()
                     if text_wrapper is not None:
-                        verse_text = "\n".join(text_wrapper.wrap(verse_text))
-                    file.write(verse_text + "\n")
+                        verse_lines = [
+                            x for line in verse_lines for x in text_wrapper.wrap(line)
+                        ]
+                    file.write(("\n" + " " * indent).join(verse_lines) + "\n")
 
 
 def main():
@@ -172,7 +220,11 @@ def main():
         help="The bible.com specific ID for the bible. Can be found in the URL of the bible version.",
     )
     argparser.add_argument("output_dir", help="The base dir for the output.")
-    argparser.add_argument("book", nargs="?", help="Only download this book. Should be the 3-letter code for the book.")
+    argparser.add_argument(
+        "book",
+        nargs="?",
+        help="Only download this book. Should be the 3-letter code for the book.",
+    )
     line_len_group = argparser.add_mutually_exclusive_group()
     line_len_group.add_argument(
         "-l",

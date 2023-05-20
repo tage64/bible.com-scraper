@@ -5,6 +5,8 @@ from textwrap import TextWrapper
 import math
 import os
 import asyncio
+import itertools
+from enum import Enum
 from typing import *
 
 import bs4
@@ -17,10 +19,32 @@ HTTP_TRIES: int = 3
 NUM_REGEX: re.Pattern = re.compile("[1-9][0-9]*")
 CHAPTER_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_chapter.*")
 VERSE_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_verse.*")
+HEADING_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_heading.*")
 CONTENT_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_content.*")
+NOTE_CLASS_REGEX: re.Pattern = re.compile("ChapterContent_note.*")
 VERSE_USFM_REGEX: re.Pattern = re.compile(
     "([A-Za-z0-9]+)\.([1-9][0-9]*)\.([1-9][0-9]*)"
 )
+
+
+class Note(NamedTuple):
+    "A note in a verse."
+    text: str
+
+
+class Verse(NamedTuple):
+    "A verse is a tuple of its number and content."
+    number: int
+    content: list[str | Note]
+
+
+class Heading(NamedTuple):
+    "A heading in a chapter."
+    text: str
+
+
+# A chapter is a list of headings and verses. If an element is `None`, that means that the verse is missing.
+Chapter = list[Heading | Verse]
 
 
 class Book(NamedTuple):
@@ -28,8 +52,7 @@ class Book(NamedTuple):
     code: str  # 3-letter code for the book.
     idx: int  # 1-based index of the book in the bible.
     name: str  # The name of the book.
-    # A list of chapters, which are lists of verses. Note that some verses can be missing, hence None.
-    chapters: list[list[str | None]]
+    chapters: list[Chapter]
 
 
 async def get_bible(bible_id: int, book_code: str | None = None) -> list[Book]:
@@ -70,12 +93,12 @@ async def get_bible(bible_id: int, book_code: str | None = None) -> list[Book]:
 
 async def get_chapters(
     book_code: str, bible_id: int, http_client: httpx.AsyncClient
-) -> list[list[str | None]]:
+) -> list[Chapter]:
     "Get all chapters (which are lists of verses) for a specific book."
     no_chapters: int = await get_no_chapters(book_code, bible_id, http_client)
     return await asyncio.gather(
         *map(
-            lambda i: get_verses(book_code, i, bible_id, http_client),
+            lambda i: get_chapter(book_code, i, bible_id, http_client),
             range(no_chapters),
         )
     )
@@ -107,12 +130,10 @@ async def get_no_chapters(
     return len(data["items"])
 
 
-async def get_verses(
+async def get_chapter(
     book_code: str, chapter_idx: int, bible_id: int, http_client: httpx.AsyncClient
-) -> list[str | None]:
-    """Get a list of all verses in a chapter.
-    Some verses might be missing and is then set to `None`.
-    """
+) -> Chapter:
+    "Retrieve the content of a chapter."
     url = f"https://www.bible.com/bible/{bible_id}/{book_code}.{chapter_idx+1}.KJV"
     tries: int = 1
     while True:
@@ -130,35 +151,82 @@ async def get_verses(
 
     # This is a list of HTML tags corresponding to verses.
     # There might be zero to many number of verse-tags per verse.
-    verse_tags: List = chapter_find.find_all(class_=VERSE_CLASS_REGEX)
+    verse_and_heading_tags: List = chapter_find.find_all(
+        class_=[VERSE_CLASS_REGEX, HEADING_CLASS_REGEX]
+    )
 
-    verses: list[str | None] = []
-    for verse_tag in verse_tags:
-        assert isinstance(verse_tag, bs4.Tag)
-        current_verse_no: int = len(verses)
-        usfm = verse_tag["data-usfm"]
-        assert isinstance(usfm, str)
-        usfm_match = VERSE_USFM_REGEX.fullmatch(usfm)
-        assert isinstance(usfm_match, re.Match), f"Couldn't match usfm code: {usfm}."
-        assert (
-            usfm_match[1] == book_code
-        ), f"Wrong book code for verse {usfm_match.string}, expected {book_code}."
-        assert usfm_match[2] == str(
-            chapter_idx + 1
-        ), f"Wrong chapter index for verse. {usfm_match.string}, expected {chapter_idx + 1}."
-        verse_no: int = int(usfm_match[3])
-        assert verse_no >= current_verse_no, "Verses are not in order."
-        content_tags: List = verse_tag.find_all(class_=CONTENT_CLASS_REGEX)
-        contents: str = "".join((x.string for x in content_tags))
-        if verse_no == current_verse_no:
-            assert isinstance(verses[-1], str)
-            verses[-1] += "\n" + contents
+    chapter: Chapter = Chapter([])
+    for tag in verse_and_heading_tags:
+        assert isinstance(tag, bs4.Tag)
+        if isinstance(tag["class"], list):
+            tag_class: str = tag["class"][0]
         else:
-            while verse_no > current_verse_no + 1:
-                verses.append(None)
-                current_verse_no += 1
-            verses.append(contents)
-    return verses
+            tag_class = tag["class"]
+        if HEADING_CLASS_REGEX.fullmatch(tag_class):
+            assert tag.string is not None
+            if chapter != [] and isinstance(chapter[-1], Heading):
+                # Multiple headings without text between are concatinated.
+                chapter[-1] = Heading(chapter[-1].text + " " + tag.string)
+            else:
+                chapter.append(Heading(tag.string))
+        elif VERSE_CLASS_REGEX.fullmatch(tag_class):
+            usfm = tag["data-usfm"]
+            assert isinstance(usfm, str)
+            usfm_match = VERSE_USFM_REGEX.fullmatch(usfm)
+            assert isinstance(
+                usfm_match, re.Match
+            ), f"Couldn't match usfm code: {usfm}."
+            assert (
+                usfm_match[1] == book_code
+            ), f"Wrong book code for verse {usfm_match.string}, expected {book_code}."
+            assert usfm_match[2] == str(
+                chapter_idx + 1
+            ), f"Wrong chapter index for verse. {usfm_match.string}, expected {chapter_idx + 1}."
+            verse_no: int = int(usfm_match[3])
+            content_and_note_tags: list = tag.find_all(
+                class_=[CONTENT_CLASS_REGEX, NOTE_CLASS_REGEX]
+            )
+            verse_content: list[str | Note] = []
+            for inner_tag in content_and_note_tags:
+                assert isinstance(inner_tag, bs4.Tag)
+                text: str = "".join(inner_tag.stripped_strings).strip()
+                if not text:
+                    continue
+                if isinstance(inner_tag["class"], list):
+                    inner_tag_class: str = inner_tag["class"][0]
+                else:
+                    inner_tag_class = inner_tag["class"]
+                if CONTENT_CLASS_REGEX.fullmatch(inner_tag_class):
+                    if verse_content and isinstance(verse_content[-1], str):
+                        verse_content[-1] += text
+                    else:
+                        verse_content.append(text)
+                else:
+                    verse_content.append(Note(text))
+            if not verse_content:
+                continue
+            if (
+                chapter != []
+                and isinstance(chapter[-1], Verse)
+                and chapter[-1].number == verse_no
+            ):
+                # Two adjacent verse tags with the same number aare concatinated.
+                chapter[-1] = Verse(verse_no, chapter[-1].content + verse_content)
+            else:
+                chapter.append(Verse(verse_no, verse_content))
+        else:
+            assert False, f"Bad verse item class: {tag['class']}"
+    return chapter
+
+
+# Warning to the reader: The following function is a bit messy and poorly documented.
+# It does the job of writing the bible to pretty looking text files.
+
+# A TextBlock is either just a string, or it is a prefix
+# followed by a list of TextBlocks. The intention is to print the prefix followed by each
+# block indented as much as the prefix is wide.
+# This type is only used in the following function, but needs to be toplevel to to make mypy happy.
+TextBlock = str | Tuple[str, list["TextBlock"]]
 
 
 async def store_bible(
@@ -166,14 +234,51 @@ async def store_bible(
     output_dir: str,
     book_code: str | None = None,
     max_line_len: int | None = None,
+    include_notes: bool = False,
 ) -> None:
     """Fetch the bible and save it in `output_dir` with one sub-directory per book
     and one file per chapter.
     The argument `book` can be set to a 3-letter code to specify a certain book to download.
     """
-    text_wrapper: TextWrapper | None = (
-        TextWrapper(replace_whitespace=False) if max_line_len else None
-    )
+
+    def text_block_to_str(text: TextBlock) -> str:
+        def text_block_to_lines(
+            text: TextBlock, max_line_len: int | None
+        ) -> Iterable[str]:
+            "Convert a TextBlock to a string, see the comment for TextBlock for more info."
+            if isinstance(text, str):
+                return text.splitlines()
+            (prefix, items) = text
+            indent: int = len(prefix)
+            inner_line_len: int | None = (
+                max_line_len - indent if max_line_len is not None else None
+            )
+            assert (
+                inner_line_len is None or inner_line_len > 0
+            ), f"Lines are too short with prefix: {prefix}"
+            lines: Iterable[str] = (
+                line
+                for item in items
+                for line in text_block_to_lines(item, inner_line_len)
+            )
+            if inner_line_len is not None:
+                text_wrapper: TextWrapper = TextWrapper(
+                    width=inner_line_len, replace_whitespace=False
+                )
+                lines = (
+                    wrapped_line
+                    for line in lines
+                    for wrapped_line in text_wrapper.wrap(line)
+                )
+            return (
+                x + y
+                for (x, y) in itertools.zip_longest(
+                    [prefix], lines, fillvalue=" " * indent
+                )
+            )
+
+        return "\n".join(text_block_to_lines(text, max_line_len)) + "\n"
+
     books: list[Book] = await get_bible(bible_id, book_code)
     for book in books:
         # Make a directory for the book.
@@ -187,27 +292,46 @@ async def store_bible(
 
         for j, chapter in enumerate(book.chapters):
             # Compute the length of the numbers for the verses.
-            verse_num_len: int = math.ceil(math.log10(len(chapter)))
-            indent: int = verse_num_len + 2
-            if text_wrapper is not None:
-                assert max_line_len is not None
-                assert max_line_len > indent, "Lines are too short for verse numbers."
-                text_wrapper.width = max_line_len - indent
+            verse_num_len: int = math.ceil(
+                math.log10(max((x.number for x in chapter if isinstance(x, Verse))))
+            )
 
             with open(
                 os.path.join(book_dir, f"{str(j + 1).rjust(chapter_num_len, '0')}.txt"),
                 "w",
             ) as file:
-                for k, verse in enumerate(chapter):
-                    if verse is None:
-                        continue
-                    file.write(str(k + 1).rjust(verse_num_len, " ") + ". ")
-                    verse_lines: list[str] = verse.splitlines()
-                    if text_wrapper is not None:
-                        verse_lines = [
-                            x for line in verse_lines for x in text_wrapper.wrap(line)
-                        ]
-                    file.write(("\n" + " " * indent).join(verse_lines) + "\n")
+                notes: list[Note] = []
+                for item in chapter:
+                    if isinstance(item, Verse):
+                        prefix: str = (
+                            " " + str(item.number).rjust(verse_num_len, " ") + ". "
+                        )
+                        text_blocks: list[str] = []
+                        prev_segment_type = None
+                        for segment in item.content:
+                            if isinstance(segment, str):
+                                match prev_segment_type:
+                                    case None | "text":
+                                        text_blocks.append(segment)
+                                    case "note":
+                                        text_blocks[-1] += " " + segment
+                                prev_segment_type = "text"
+                            else:
+                                if not include_notes:
+                                    continue
+                                notes.append(segment)
+                                reference_text: str = f"[{len(notes)}]"
+                                match prev_segment_type:
+                                    case None:
+                                        text_blocks.append(reference_text)
+                                    case "text" | "note":
+                                        text_blocks[-1] += " " + reference_text
+                                prev_segment_type = "note"
+                        file.write(text_block_to_str((prefix, text_blocks)))  # type: ignore
+                    else:
+                        file.write(text_block_to_str(("# ", [item.text])))
+                for i, note in enumerate(notes):
+                    file.write(text_block_to_str((f"[{i+1}] ", [note.text])))
 
 
 def main():
@@ -224,6 +348,9 @@ def main():
         "book",
         nargs="?",
         help="Only download this book. Should be the 3-letter code for the book.",
+    )
+    argparser.add_argument(
+        "--notes", action="store_true", help="Include notes for each chapter."
     )
     line_len_group = argparser.add_mutually_exclusive_group()
     line_len_group.add_argument(
@@ -243,6 +370,7 @@ def main():
             args.output_dir,
             max_line_len=args.line_length if not args.no_wrap_lines else None,
             book_code=args.book,
+            include_notes=args.notes,
         )
     )
 

@@ -137,13 +137,17 @@ async def get_chapter(
     url = f"https://www.bible.com/bible/{bible_id}/{book_code}.{chapter_idx+1}.KJV"
     tries: int = 1
     while True:
+        assert tries <= HTTP_TRIES, f"Http timeout with {tries} tries."
         try:
             page = await http_client.get(url)
-            break
+            if page.status_code in [429, 503]:
+                # It would probably be better to check the Retry-After header here.
+                await asyncio.sleep(2)
+                tries += 1
+            else:
+                break
         except httpx.ReadTimeout:
-            assert tries < HTTP_TRIES, f"Http timeout with {tries} tries."
             tries += 1
-            continue
     page.raise_for_status()  # Raise an exception if the request failed with a bad status code.
     soup = bs4.BeautifulSoup(page.content, "html.parser")
     chapter_find = soup.find(class_=CHAPTER_CLASS_REGEX)
